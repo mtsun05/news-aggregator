@@ -11,28 +11,29 @@ load_dotenv()
 anth_client = AsyncAnthropic()
 NEWS_API_KEY = get_key(".env", "NEWS_API_KEY_2")
 
-system="""
+haiku_system_prompt="""
 You are a summarizing assistant. The user will provide you with an article to summarize. Your job is to highlight key takeaways, interesting findings, any data used, and statistics reported in the article. Remember, your job is simply to report to the user what was in the article in a concise manner. They will use the information to write a summary themselves, so do not take it upon yourself to write anything extra about the article.
 """
 
-async def search_article_url(article: dict) -> dict:
+async def search_article_url(article: dict, client: httpx.AsyncClient) -> dict:
 	if not article.get("url"):
 		return article
 
 	try:
-		async with httpx.AsyncClient() as client:
-			resp = await client.get(article["url"], follow_redirects=True, timeout=10)
+		resp = await client.get(article["url"], follow_redirects=True, timeout=10)
 		doc = Document(resp.text)
 		text = BeautifulSoup(doc.summary(), "html.parser").get_text("\n", strip=True)
-		print(text)
+
 		haiku_res = await anth_client.messages.create(
 			model="claude-haiku-4-5-20251001",
 			max_tokens=500,
-			system=system,
+			system=haiku_system_prompt,
 			messages=[{"role": "user", "content": text}]
 		)
 		article["full_content"] = haiku_res.content[0].text
-	except Exception:
+	
+	except Exception as e:
+		print(f"[enrichment] Failed for {article.get('url', '?')}: {e}")
 		article["full_content"] = article.get("description", "")
 
 	return article
@@ -65,53 +66,63 @@ def format_articles_by_category(articles: list[dict]) -> str:
 
 	return "\n\n".join(parts)
 
+async def fetch_category(client: httpx.AsyncClient, query: str, domains: str, page_size: int, label: str) -> tuple[str, list[dict]]:
+	try:
+		resp = await client.get(
+			"https://newsapi.org/v2/everything",
+			params={
+				"apiKey": NEWS_API_KEY,
+				"q": query,
+				"domains": domains,	
+				"sortBy": "relevancy",
+				"pageSize": page_size,
+			},
+			timeout=10.0,
+		)
+		resp.raise_for_status()
+		data = resp.json()
+
+		if data.get("status") != "ok":
+			print(f"[{label}] API error: {data.get('message', 'unknown')}")
+			return label, []
+
+		return label, data.get("articles", [])
+
+	except httpx.TimeoutException:
+		print(f"[{label}] Request timed out")
+		return label, []
+	except httpx.HTTPStatusError as e:
+		print(f"[{label}] HTTP {e.response.status_code}: {e.response.text[:200]}")
+		return label, []
+	except Exception as e:
+		print(f"[{label}] Unexpected error: {e}")
+		return label, []
+
 async def fetch_news_api(query: str, max_articles: int) -> str:
 	per_category = max_articles // 3
 
-	left_sources = "apnews.com,cbsnews.com,businessinsider.com,washingtonpost.com,us.cnn.com,nbcnews.com"
-	center_sources = "bbc.co.uk,bloomberg.com,politico.com,thehill.com,usatoday.com,newsweek.com,fortune.com"
-	right_sources = "foxnews.com,theamericanconservative.com,breitbart.com,washingtontimes.com"
-
-	async with httpx.AsyncClient() as client:
-		left, center, right = await asyncio.gather(
-			client.get("https://newsapi.org/v2/everything", params={
-				"apiKey": NEWS_API_KEY,
-				"q": query,
-				"domains": left_sources,
-				"sortBy": "relevancy",
-				"pageSize": per_category
-			}),
-			client.get("https://newsapi.org/v2/everything", params={
-				"apiKey": NEWS_API_KEY,
-				"q": query,
-				"domains": center_sources,
-				"sortBy": "relevancy",
-				"pageSize": per_category
-			}),
-			client.get("https://newsapi.org/v2/everything", params={
-				"apiKey": NEWS_API_KEY,
-				"q": query,
-				"domains": right_sources,
-				"sortBy": "relevancy",
-				"pageSize": per_category
-			}),
-		)
-	
-	print("LEFT:", left.json().get("status"), "total:", left.json().get("totalResults"), "error:", left.json().get("message", "none"))
-	print("CENTER:", center.json().get("status"), "total:", center.json().get("totalResults"), "error:", center.json().get("message", "none"))
-	print("RIGHT:", right.json().get("status"), "total:", right.json().get("totalResults"), "error:", right.json().get("message", "none"))
-
-	articles = {
-		"LEFT": left.json().get("articles", []),
-		"CENTER": center.json().get("articles", []),
-		"RIGHT": right.json().get("articles", []),
+	categories = {
+		"LEFT": "apnews.com,cbsnews.com,businessinsider.com,washingtonpost.com,us.cnn.com,nbcnews.com",
+		"CENTER": "bbc.co.uk,bloomberg.com,politico.com,thehill.com,usatoday.com,newsweek.com,fortune.com",
+		"RIGHT": "foxnews.com,theamericanconservative.com,breitbart.com,washingtontimes.com"
 	}
 
-	all_articles = []
-	for cat, items in articles.items():
-		for article in items:
-			article["_category"] = cat
-			all_articles.append(article)
+	async with httpx.AsyncClient() as client:
+		results = await asyncio.gather(*[
+			fetch_category(client, query, domains, per_category, label)
+			for label, domains in categories.items()
+		])
 
-	enriched = await asyncio.gather(*[search_article_url(a) for a in all_articles])
+		all_articles = []
+		for label, items in results:
+			for article in items:
+				article["_category"] = label
+				all_articles.append(article)
+
+		enriched = await asyncio.gather(
+			*[search_article_url(a, client) for a in all_articles],
+			return_exceptions=True,
+		)
+		enriched = [a for a in enriched if not isinstance(a, Exception)]
+
 	return format_articles_by_category(enriched)
