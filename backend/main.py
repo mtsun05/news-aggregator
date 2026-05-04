@@ -15,7 +15,6 @@ app.add_middleware(
 
 app.include_router(news_router)
 
-
 @app.get("/")
 def root():
     return {"message": "Hello from FastAPI"}

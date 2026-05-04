@@ -1,13 +1,23 @@
 import dotenv
+import util.langcache as langcache
 
 from anthropic import AsyncAnthropic
-from fastapi import APIRouter
+from contextlib import asynccontextmanager
+from httpx import AsyncClient
+from fastapi import FastAPI, APIRouter, Request, BackgroundTasks
 from pydantic import BaseModel
 from util.news import fetch_news_api
 
 dotenv.load_dotenv()
 
-router = APIRouter(prefix="/news", tags=["news"])
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # global client that cleans up resources on shutdown
+    client = AsyncClient()
+    yield {"redis_http_client": client}
+    await client.aclose()
+
+router = APIRouter(prefix="/news", tags=["news"], lifespan=lifespan)
 client = AsyncAnthropic()
 
 system_prompt = """
@@ -30,10 +40,12 @@ class SearchRequest(BaseModel):
 	detail: str = "summary"
 
 @router.post("/search")
-async def search_news(request: SearchRequest):
+async def search_news(request: Request, req_data: SearchRequest, bg_tasks: BackgroundTasks):
+    redis_http_client = request.app.state.redis_http_client
+
     max_tokens = 0
     max_articles = 0
-    match request.detail:
+    match req_data.detail:
         case "detailed":
             max_tokens = 1500
             max_articles = 12
@@ -43,21 +55,48 @@ async def search_news(request: SearchRequest):
         case "quick":
             max_tokens = 500
             max_articles = 6
+        case _:
+            max_tokens, max_articles = 1000, 9
+            req_data.detail = "summary"
+    
+    # check cache
+    cache_res = await langcache.check_cache(redis_http_client, req_data.query, req_data.detail)
+    if cache_res:
+        return {
+            "answer": cache_res,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0
+            }
+        }
 
-    context = await fetch_news_api(request.query, max_articles=max_articles)
+    # fetch news, get summaries
+    context = await fetch_news_api(req_data.query, max_articles=max_articles)
 
+    # synthesize with Sonnet
     response = await client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=max_tokens,
         system=system_prompt,
         messages=[{
             "role": "user",
-            "content": f"Query:{request.query}, context:{context}"
+            "content": f"Query:{req_data.query}, context:{context}"
         }],
     )
+    answer = response.content[0].text
+    
+    # insert into cache in the background
+    bg_tasks.add_task(
+        langcache.insert_pair, 
+        redis_http_client, 
+        req_data.query, 
+        answer, 
+        req_data.detail
+    )
 
+    # return to client
     return {
-        "answer": response.content[0].text,
+        "answer": answer,
         "usage": {
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens
